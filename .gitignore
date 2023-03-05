@@ -1,3 +1,10 @@
 **__pycache__**
 .vscode
 *.ipynb
+*.json
+*.txt
+*.train
+*.eval
+logs
+*.pt
+.idea

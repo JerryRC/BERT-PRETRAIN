@@ -62,12 +62,13 @@ class PreTrainingDataset(Dataset):
 
 def write_instance_to_example_files(instances, tokenizer, max_seq_length, output_file):
     """ 以 TrainingInstance 创造 Dataset 训练实例"""
-    dataset = PreTrainingDataset()
+    eval_set = PreTrainingDataset()
+    train_set = PreTrainingDataset()
 
     total_written = 0
     for (inst_index, instance) in enumerate(instances):
         input_ids = tokenizer.convert_tokens_to_ids(instance.tokens)
-        input_ids_copy_for_replace = list(input_ids)    # 用于替换 mask 原字符得到 label
+        input_ids_copy_for_replace = list(input_ids)  # 用于替换 mask 原字符得到 label
         input_mask = [1] * len(input_ids)
         segment_ids = list(instance.segment_ids)
         assert len(input_ids) <= max_seq_length
@@ -93,9 +94,9 @@ def write_instance_to_example_files(instances, tokenizer, max_seq_length, output
             input_ids_copy_for_replace.append(-1)
 
         # while len(masked_lm_positions) < max_predictions_per_seq:
-            # masked_lm_positions.append(0)
-            # masked_lm_ids.append(0)
-            # masked_lm_weights.append(0.0)
+        #     masked_lm_positions.append(0)
+        #     masked_lm_ids.append(0)
+        #     masked_lm_weights.append(0.0)
 
         # 这里注意：按照原文思路，随机下一句的 label 为 1，而真实下一句的 label 为 0 。
         next_sentence_label = 1 if instance.is_random_next else 0
@@ -106,7 +107,10 @@ def write_instance_to_example_files(instances, tokenizer, max_seq_length, output
         features["masked_lm_ids"] = create_long_tensor(input_ids_copy_for_replace)
         features["next_sentence_labels"] = create_long_tensor([next_sentence_label])
 
-        dataset.add_instance(features)
+        if total_written < len(instances) * 0.10:
+            eval_set.add_instance(features)
+        else:
+            train_set.add_instance(features)
         total_written += 1
 
         # if inst_index < 20:
@@ -122,10 +126,12 @@ def write_instance_to_example_files(instances, tokenizer, max_seq_length, output
         #             values = feature.float_list.value
         #         logger.info("%s: %s" % (feature_name, " ".join([str(x) for x in values])))
 
-    with open(output_file, 'wb') as f:
-        pickle.dump(dataset, f)
+    with open(output_file + '.eval', 'wb') as f:
+        pickle.dump(eval_set, f)
+    with open(output_file + '.train', 'wb') as f:
+        pickle.dump(train_set, f)
 
-    logger.info("Wrote %d total instances", total_written)
+    logger.info("Wrote %d total instances" % total_written)
 
 
 def create_long_tensor(values):
@@ -189,22 +195,14 @@ def create_instances_from_document(
     # 因为句子包含 [CLS], [SEP], [SEP] 所以长度减三
     max_num_tokens = max_seq_length - 3
 
-    # We *usually* want to fill up the entire sequence since we are padding
-    # to `max_seq_length` anyways, so short sequences are generally wasted
-    # computation. However, we *sometimes*
-    # (i.e., short_seq_prob == 0.1 == 10% of the time) want to use shorter
-    # sequences to minimize the mismatch between pre-training and fine-tuning.
-    # The `target_seq_length` is just a rough target however, whereas
-    # `max_seq_length` is a hard limit.
+    # 有概率在满足 max_seq_length 的前提下随机决定新的句子总长，
+    # 以增加数据的任意性。
     target_seq_length = max_num_tokens
     if rng.random() < short_seq_prob:
         target_seq_length = rng.randint(2, max_num_tokens)
 
-    # We DON'T just concatenate all of the tokens from a document into a long
-    # sequence and choose an arbitrary split point because this would make the
-    # next sentence prediction task too easy. Instead, we split the input into
-    # segments "A" and "B" based on the actual "sentences" provided by the user
-    # input.
+    # 这里采取的策略是先预选中最大长度的几个句子片段，然后将片段以完整句子为单位随机分为 A B 两部分，
+    # 如果是进入了随机下一句的 case ，则在选完 A 中的句子后，下一句从其他段落中随机挑选句子填满该 instance。
     instances = []
     current_chunk = []
     current_length = 0
@@ -215,8 +213,8 @@ def create_instances_from_document(
         current_length += len(segment)
         if i == len(document) - 1 or current_length >= target_seq_length:
             if current_chunk:
-                # `a_end` is how many segments from `current_chunk` go into the `A`
-                # (first) sentence.
+                # a_end 代表从 current_chunk 中选择多少个句子放入 A 片段
+                # A 代表第一句话
                 a_end = 1
                 if len(current_chunk) >= 2:
                     a_end = rng.randint(1, len(current_chunk) - 1)
@@ -226,18 +224,17 @@ def create_instances_from_document(
                     tokens_a.extend(current_chunk[j])
 
                 tokens_b = []
-                # 随机的 “下一句话” 
-                is_random_next = False
+                # 随机的 “下一句话”
                 if len(current_chunk) == 1 or rng.random() < 0.5:
                     is_random_next = True
                     target_b_length = target_seq_length - len(tokens_a)
 
                     # 随机选取一个其他的段落以摘取一个“任意的”下一句话
+                    random_document_index = rng.randint(0, len(all_documents) - 1)
                     for _ in range(10):
-                        random_document_index = rng.randint(
-                            0, len(all_documents) - 1)
                         if random_document_index != document_index:
                             break
+                        random_document_index = rng.randint(0, len(all_documents) - 1)
 
                     random_document = all_documents[random_document_index]
                     random_start = rng.randint(0, len(random_document) - 1)
@@ -276,7 +273,7 @@ def create_instances_from_document(
                 segment_ids.append(1)
 
                 (tokens, masked_lm_positions, masked_lm_labels) = create_masked_lm_predictions(
-                     tokens, masked_lm_prob, max_predictions_per_seq, vocab_words, rng)
+                    tokens, masked_lm_prob, max_predictions_per_seq, vocab_words, rng)
                 instance = TrainingInstance(
                     tokens=tokens,
                     segment_ids=segment_ids,
@@ -296,7 +293,7 @@ MaskedLmInstance = collections.namedtuple("MaskedLmInstance", ["index", "label"]
 
 def create_masked_lm_predictions(tokens, masked_lm_prob,
                                  max_predictions_per_seq, vocab_words, rng):
-    """Creates the predictions for the masked LM objective."""
+    """ 按照 masked LM 的设定生成输入向量 """
 
     cand_indexes = []
     for (i, token) in enumerate(tokens):
@@ -327,7 +324,6 @@ def create_masked_lm_predictions(tokens, masked_lm_prob,
         for index in index_set:
             covered_indexes.add(index)
 
-            masked_token = None
             # 80% 的概率替换为 [MASK]
             if rng.random() < 0.8:
                 masked_token = "[MASK]"
@@ -351,11 +347,11 @@ def create_masked_lm_predictions(tokens, masked_lm_prob,
         masked_lm_positions.append(p.index)
         masked_lm_labels.append(p.label)
 
-    return (output_tokens, masked_lm_positions, masked_lm_labels)
+    return output_tokens, masked_lm_positions, masked_lm_labels
 
 
 def truncate_seq_pair(tokens_a, tokens_b, max_num_tokens, rng):
-    """Truncates a pair of sequences to a maximum sequence length."""
+    """ 将两个句子修剪至总长度小于等于设定的最大长度 """
     while True:
         total_length = len(tokens_a) + len(tokens_b)
         if total_length <= max_num_tokens:
@@ -371,7 +367,6 @@ def truncate_seq_pair(tokens_a, tokens_b, max_num_tokens, rng):
             trunc_tokens.pop()
 
 
-
 @click.command()
 @click.option("--input_file", help="Input raw text file (or comma-separated list of files).")
 @click.option("--output_file", help="Output TF example file (or comma-separated list of files).")
@@ -380,11 +375,10 @@ def truncate_seq_pair(tokens_a, tokens_b, max_num_tokens, rng):
 @click.option("--random_seed", default=519, help="Random seed for data generation.")
 @click.option("--dupe_factor", default=10, help="Number of times to duplicate the input data (with different masks).")
 @click.option("--masked_lm_prob", default=0.15, type=float, help="Masked LM probability.")
-@click.option("--short_seq_prob", default=0.1, type=float, 
+@click.option("--short_seq_prob", default=0.1, type=float,
               help="Probability of creating sequences which are shorter than the maximum length.")
 def main(input_file, output_file, max_seq_length, max_predictions_per_seq,
-          random_seed, dupe_factor, masked_lm_prob, short_seq_prob):
-    
+         random_seed, dupe_factor, masked_lm_prob, short_seq_prob):
     logger.info("*** Loading the tokenizer ***")
     tokenizer = BertTokenizer.from_pretrained("bert-base-chinese")
 
@@ -400,7 +394,7 @@ def main(input_file, output_file, max_seq_length, max_predictions_per_seq,
         short_seq_prob, masked_lm_prob, max_predictions_per_seq, rng)
 
     logger.info("*** Writing to output file ***")
-    logger.info("  %s" % output_file)
+    logger.info("  %s.train  %s.eval" % (output_file, output_file))
 
     write_instance_to_example_files(instances, tokenizer, max_seq_length, output_file)
 
